@@ -1,47 +1,39 @@
-module normalization_pipeline (
+module min_max_normalizer (
     input clk,
-    input [11:0] pixel_in,
+    input [11:0] log_pixel_in,
     input [11:0] frame_min,
     input [11:0] frame_max,
-    output reg [7:0] pixel_out
+    output reg [7:0] enhanced_pixel_out
 );
-
-    // Pipeline registers for each clock cycle stage
-    reg [11:0] num_diff;
-    reg [11:0] den_diff;
-    reg [23:0] scale_factor;
-    reg [35:0] mult_result;
-
-    // The Reciprocal LUT: 4096 entries, 24-bits wide
-    // Stores the pre-calculated value of: (255 * 4096) / index
-    reg [23:0] reciprocal_lut [0:4095]; 
-
+    
+    // Memory for the Reciprocal Look-Up Table (4096 entries of 16-bits)
+    reg [15:0] reciprocal_rom [0:4095];
+    
     initial begin
-        // Load the pre-calculated multiplier value
-        $readmemh("reciprocal.mem", reciprocal_lut); 
+        $readmemh("reciprocal.mem", reciprocal_rom);
     end
 
+    // Pipeline registers for the math stages
+    reg [11:0] delta;
+    reg [11:0] numerator;
+    reg [15:0] scale_factor;
+    reg [27:0] scaled_result;
+
     always @(posedge clk) begin
+        // Stage 1: Calculate Delta and Numerator (val - min)
+        delta <= (frame_max > frame_min) ? (frame_max - frame_min) : 12'd1;
+        numerator <= (log_pixel_in > frame_min) ? (log_pixel_in - frame_min) : 12'd0;
 
-        // STAGE 1: Subtraction
-        // Calculate the numerator (V_in - V_min)
-        num_diff <= (pixel_in > frame_min) ? (pixel_in - frame_min) : 12'd0;
-	// Calculate the denominator value and prevent division by 0 error
-        den_diff <= (frame_max > frame_min) ? (frame_max - frame_min) : 12'd1;
+        // Stage 2: Fetch the inverse multiplier from the Block RAM
+        scale_factor <= reciprocal_rom[delta];
 
-        // STAGE 2: Memory Read(reading from the LUT)
-        scale_factor <= reciprocal_lut[den_diff]; 
+        // Stage 3: Multiply
+        scaled_result <= numerator * scale_factor;
 
-        // STAGE 3: Multiply
-        // Multiply the pixel difference by the scaled fraction
-        mult_result <= num_diff * scale_factor;
-        
-        // STAGE 4: Shift and Output
-        // Undo the 4096 scaling by shifting right 12 bits (>> 12).
-        // The result is our final 8-bit pixel (clamped to 255 just in case).
-        if (mult_result[35:12] > 255) 
-            pixel_out <= 8'd255;
-        else 
-            pixel_out <= mult_result[19:12]; 
+        // Stage 4: Shift right by 16 bits (divide by 65536) and clamp to 8-bit max
+        if ((scaled_result >> 16) > 28'd255)
+            enhanced_pixel_out <= 8'd255;
+        else
+            enhanced_pixel_out <= scaled_result[23:16]; 
     end
 endmodule

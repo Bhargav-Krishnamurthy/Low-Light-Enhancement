@@ -19,6 +19,6 @@ module gaussian_5x5 (
 	       (p51*1) + (p52*4) + (p53*7) + (p54*4) + (p55*1);
                               
         // Divide by 273 using a hardware trick: multiply by 15, divide by 4096 (shift right 12)
-        pixel_out <= ((num << 4) - num) >> 12; 
+        pixel_out <= (sum * 32'd15) >> 12;
     end
 endmodule

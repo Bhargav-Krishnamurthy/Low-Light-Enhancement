@@ -6,6 +6,7 @@ module min_max_tracker (
     output reg [11:0] frame_min,
     output reg [11:0] frame_max
 );
+    
     reg [11:0] current_min;
     reg [11:0] current_max;
 
