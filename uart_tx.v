@@ -17,10 +17,10 @@ module uart_tx #(
                DATA  = 2'b10,
                STOP  = 2'b11;
 
-    reg [1:0]  state = IDLE;
-    reg [15:0] clk_count = 0;
-    reg [2:0]  bit_idx = 0;
-    reg [7:0]  tx_buf = 8'h00;
+    reg [1:0]  state;
+    reg [15:0] clk_count;
+    reg [2:0]  bit_idx;
+    reg [7:0]  tx_buf;
 
     always @(posedge clk) begin
         if (rst) begin
@@ -33,7 +33,7 @@ module uart_tx #(
         end else begin
             case (state)
                 IDLE: begin
-                    tx      <= 1'b1; // Fixed: was "1 meb1"
+                    tx      <= 1'b1; 
                     tx_busy <= 1'b0;
                     if (tx_start) begin
                         tx_buf    <= tx_data;
