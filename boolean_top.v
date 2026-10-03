@@ -1,11 +1,11 @@
 `timescale 1ns / 1ps
 module boolean_top (
-    input  wire        clk,          // Pin F14 
-    input  wire        rst,          // Pin J2 (BTN0)
-    input  wire        btn1,         // Pin J1 (Frame Start Trigger)
-    input  wire        rx,           
-    output wire        tx,           
-    output wire [15:0] led           
+    input  wire        clk,
+    input  wire        rst,
+    input  wire        btn1,
+    input  wire        rx,
+    output wire        tx,
+    output wire [15:0] led
 );
     // Button Debounce and Sync
     reg rst_sync1=1, rst_sync2=1;
@@ -14,14 +14,14 @@ module boolean_top (
         rst_sync1 <= rst; rst_sync2 <= rst_sync1;
         btn1_sync1 <= btn1; btn1_sync2 <= btn1_sync1; btn1_sync3 <= btn1_sync2;
     end
-    wire frame_start = btn1_sync2 & ~btn1_sync3; // 1-clock pulse on press
+    wire frame_start = btn1_sync2 & ~btn1_sync3;
 
     // UART RX
     wire [7:0] rx_byte;
     wire rx_done;
     uart_rx #(.CLK_FREQ(100000000), .BAUD_RATE(115200)) u_rx (.clk(clk), .rst(rst_sync2), .rx(rx), .rx_data(rx_byte), .rx_valid(rx_done));
 
-    // RX State Machine (Packs 3 UART bytes into 24-bit RGB)
+    // RX State Machine (Packs 3 bytes -> 1 Pixel)
     reg [1:0] rx_byte_cnt = 0;
     reg [23:0] rgb_in;
     reg valid_to_pipeline = 0;
@@ -53,6 +53,23 @@ module boolean_top (
         .pixel_out(rgb_out), .valid_out(valid_from_pipeline)
     );
 
+    // ==========================================
+    // THE WAITING ROOM (Pixel FIFO)
+    // ==========================================
+    reg [23:0] pixel_fifo [0:15];
+    reg [3:0] fifo_head = 0;
+    reg [3:0] fifo_tail = 0;
+    wire fifo_empty = (fifo_head == fifo_tail);
+
+    always @(posedge clk) begin
+        if (rst_sync2) begin
+            fifo_head <= 0;
+        end else if (valid_from_pipeline) begin
+            pixel_fifo[fifo_head] <= rgb_out;
+            fifo_head <= fifo_head + 1;
+        end
+    end
+
     // UART TX and Edge Detector
     reg tx_start;
     reg [7:0] tx_data;
@@ -64,7 +81,7 @@ module boolean_top (
 
     uart_tx #(.CLK_FREQ(100000000), .BAUD_RATE(115200)) u_tx (.clk(clk), .rst(rst_sync2), .tx_start(tx_start), .tx_data(tx_data), .tx(tx), .tx_busy(tx_busy));
 
-    // TX State Machine (Unpacks 24-bit RGB to 3 UART bytes)
+    // TX State Machine (Unpacks 1 Pixel -> 3 Bytes)
     localparam TX_IDLE = 0, TX_SEND_R = 1, TX_SEND_G = 2, TX_SEND_B = 3;
     reg [2:0] tx_state = TX_IDLE;
     reg [23:0] tx_buffer;
@@ -73,13 +90,15 @@ module boolean_top (
         if (rst_sync2) begin
             tx_state <= TX_IDLE;
             tx_start <= 0;
+            fifo_tail <= 0;
         end else begin
             tx_start <= 0; 
             case (tx_state)
                 TX_IDLE: begin
-                    if (valid_from_pipeline) begin
-                        tx_buffer <= rgb_out;
-                        tx_data   <= rgb_out[23:16];
+                    if (!fifo_empty) begin
+                        tx_buffer <= pixel_fifo[fifo_tail];
+                        tx_data   <= pixel_fifo[fifo_tail][23:16];
+                        fifo_tail <= fifo_tail + 1; // Passenger leaves Waiting Room
                         tx_start  <= 1'b1;
                         tx_state  <= TX_SEND_R;
                     end
@@ -106,8 +125,8 @@ module boolean_top (
     end
 
     // Diagnostic LEDs
-    assign led[15] = btn1_sync2;       // Illuminates when Frame Start is pressed
+    assign led[15] = btn1_sync2;
     assign led[14] = rst_sync2;        
     assign led[13:8] = 0;
-    assign led[7:0] = rgb_out[23:16];  // Displays processed Red channel
+    assign led[7:0] = tx_buffer[23:16]; 
 endmodule

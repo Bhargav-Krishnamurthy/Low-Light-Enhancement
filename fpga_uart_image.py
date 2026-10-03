@@ -8,7 +8,7 @@ import sys
 # Change this to match your FPGA's port. 
 # Windows: 'COM3', 'COM4', etc. (Check Device Manager)
 # Mac/Linux: '/dev/ttyUSB0' or '/dev/cu.usbserial-...'
-PORT = '/dev/ttyS7' 
+PORT = '/dev/ttyUSB1' 
 BAUD_RATE = 115200
 WIDTH = 256
 HEIGHT = 256
