@@ -1,0 +1,484 @@
+boolean_top.v : 
+`timescale 1ns / 1ps
+module boolean_top (
+    input  wire        clk,
+    input  wire        rst,
+    input  wire        btn1,
+    input  wire        rx,
+    output wire        tx,
+    output wire [15:0] led
+);
+    // Button Debounce and Sync
+    reg rst_sync1=1, rst_sync2=1;
+    reg btn1_sync1=0, btn1_sync2=0, btn1_sync3=0;
+    always @(posedge clk) begin
+        rst_sync1 <= rst; rst_sync2 <= rst_sync1;
+        btn1_sync1 <= btn1; btn1_sync2 <= btn1_sync1; btn1_sync3 <= btn1_sync2;
+    end
+    wire frame_start = btn1_sync2 & ~btn1_sync3;
+
+    // UART RX
+    wire [7:0] rx_byte;
+    wire rx_done;
+    uart_rx #(.CLK_FREQ(100000000), .BAUD_RATE(115200)) u_rx (.clk(clk), .rst(rst_sync2), .rx(rx), .rx_data(rx_byte), .rx_valid(rx_done));
+
+    // RX State Machine (Packs 3 bytes -> 1 Pixel)
+    reg [1:0] rx_byte_cnt = 0;
+    reg [23:0] rgb_in;
+    reg valid_to_pipeline = 0;
+
+    always @(posedge clk) begin
+        if (rst_sync2) begin
+            rx_byte_cnt <= 0;
+            valid_to_pipeline <= 0;
+        end else begin
+            valid_to_pipeline <= 1'b0;
+            if (rx_done) begin
+                if (rx_byte_cnt == 0) rgb_in[23:16] <= rx_byte;
+                if (rx_byte_cnt == 1) rgb_in[15:8]  <= rx_byte;
+                if (rx_byte_cnt == 2) begin
+                    rgb_in[7:0] <= rx_byte;
+                    valid_to_pipeline <= 1'b1;
+                end
+                rx_byte_cnt <= (rx_byte_cnt == 2) ? 0 : rx_byte_cnt + 1;
+            end
+        end
+    end
+
+    // Image Enhancement Pipeline
+    wire [23:0] rgb_out;
+    wire valid_from_pipeline;
+    rgb_enhancement_top #(.IMG_WIDTH(256)) u_image_pipeline (
+        .clk(clk), .rst(rst_sync2), .valid_in(valid_to_pipeline),
+        .frame_start(frame_start), .pixel_in(rgb_in),
+        .pixel_out(rgb_out), .valid_out(valid_from_pipeline)
+    );
+
+    // ==========================================
+    // THE WAITING ROOM (Pixel FIFO)
+    // ==========================================
+    reg [23:0] pixel_fifo [0:15];
+    reg [3:0] fifo_head = 0;
+    reg [3:0] fifo_tail = 0;
+    wire fifo_empty = (fifo_head == fifo_tail);
+
+    always @(posedge clk) begin
+        if (rst_sync2) begin
+            fifo_head <= 0;
+        end else if (valid_from_pipeline) begin
+            pixel_fifo[fifo_head] <= rgb_out;
+            fifo_head <= fifo_head + 1;
+        end
+    end
+
+    // UART TX and Edge Detector
+    reg tx_start;
+    reg [7:0] tx_data;
+    wire tx_busy;
+    reg tx_busy_d;
+    
+    always @(posedge clk) tx_busy_d <= tx_busy;
+    wire tx_done_pulse = ~tx_busy & tx_busy_d; 
+
+    uart_tx #(.CLK_FREQ(100000000), .BAUD_RATE(115200)) u_tx (.clk(clk), .rst(rst_sync2), .tx_start(tx_start), .tx_data(tx_data), .tx(tx), .tx_busy(tx_busy));
+
+    // TX State Machine (Unpacks 1 Pixel -> 3 Bytes)
+    localparam TX_IDLE = 0, TX_SEND_R = 1, TX_SEND_G = 2, TX_SEND_B = 3;
+    reg [2:0] tx_state = TX_IDLE;
+    reg [23:0] tx_buffer;
+
+    always @(posedge clk) begin
+        if (rst_sync2) begin
+            tx_state <= TX_IDLE;
+            tx_start <= 0;
+            fifo_tail <= 0;
+        end else begin
+            tx_start <= 0; 
+            case (tx_state)
+                TX_IDLE: begin
+                    if (!fifo_empty) begin
+                        tx_buffer <= pixel_fifo[fifo_tail];
+                        tx_data   <= pixel_fifo[fifo_tail][23:16];
+                        fifo_tail <= fifo_tail + 1; // Passenger leaves Waiting Room
+                        tx_start  <= 1'b1;
+                        tx_state  <= TX_SEND_R;
+                    end
+                end
+                TX_SEND_R: begin
+                    if (tx_done_pulse) begin 
+                        tx_data  <= tx_buffer[15:8];
+                        tx_start <= 1'b1;
+                        tx_state <= TX_SEND_G;
+                    end
+                end
+                TX_SEND_G: begin
+                    if (tx_done_pulse) begin 
+                        tx_data  <= tx_buffer[7:0];
+                        tx_start <= 1'b1;
+                        tx_state <= TX_SEND_B;
+                    end
+                end
+                TX_SEND_B: begin
+                    if (tx_done_pulse) tx_state <= TX_IDLE;
+                end
+            endcase
+        end
+    end
+
+    // Diagnostic LEDs
+    assign led[15] = btn1_sync2;
+    assign led[14] = rst_sync2;        
+    assign led[13:8] = 0;
+    assign led[7:0] = tx_buffer[23:16]; 
+endmodule 
+
+
+uart_rx.v : 
+
+module uart_rx #(
+    parameter CLK_FREQ  = 100_000_000,
+    parameter BAUD_RATE = 115200
+)(
+    input  wire       clk,
+    input  wire       rst,
+
+    // Asynchronous UART input
+    input  wire       rx,
+
+    // Received byte
+    output reg [7:0] rx_data,
+
+    // Goes HIGH for one clock cycle when a byte is received
+    output reg       rx_valid
+);
+
+    localparam integer CLKS_PER_BIT = CLK_FREQ / BAUD_RATE; 
+    localparam integer HALF_BIT = CLKS_PER_BIT / 2; 
+
+    // synchronising
+    reg rx_sync1;
+    reg rx_sync2;
+    
+    // we do this to prevent metastability
+    always @(posedge clk) begin
+        if (rst) begin
+            rx_sync1 <= 0;
+            rx_sync2 <= 0;
+        end
+        else begin
+            rx_sync1 <= rx;
+            rx_sync2 <= rx_sync1;
+        end
+    end
+    // These are the states :
+    // IDLE: Waiting for RX to become LOW.
+    // START: We detected a possible start bit. Wait HALF_BIT clocks and verify RX is still LOW.
+    // DATA: Sample 8 data bits.
+    // STOP: Wait one bit period and verify STOP bit.
+    // DONE: A byte has been received.
+
+    localparam [2:0] IDLE  = 3'd0, START = 3'd1, DATA  = 3'd2, STOP  = 3'd3, DONE  = 3'd4;
+    reg [2:0] state;
+
+    // Counts FPGA clock cycles within one UART bit.
+    // Example: 0, 1, 2, 3, ... 867
+    // then reset back to 0.
+    reg [15:0] baud_counter;
+    
+    // Keeps track of which data bit we're currently receiving.
+    // Should count: 0 -> 1 -> 2 -> ... -> 7
+    reg [2:0] bit_counter;
+
+    // Temporary register where received bits are accumulated.
+    reg [7:0] rx_shift_reg;
+
+// The main FSM Block
+    always @(posedge clk) begin
+        if (rst) begin
+            state        <= IDLE;
+            baud_counter <= 16'd0;
+            bit_counter  <= 3'd0;
+            rx_shift_reg <= 8'd0;
+            rx_data      <= 8'd0;
+            rx_valid     <= 1'b0;
+        end
+        else begin
+            rx_valid <= 1'b0;
+            case (state)
+                IDLE: begin
+                    if (rx_sync2 == 0) begin
+                        // Start counting clocks.
+                        baud_counter <= 0;
+                        state <= START;
+                    end
+
+                end
+
+                START: begin
+                    if (baud_counter == HALF_BIT - 1) begin
+                        if (rx_sync2 == 0) begin
+                            baud_counter <= 0;
+                            bit_counter  <= 0;
+                            state        <= DATA;
+                        end
+                        else begin
+                            state <= IDLE;
+                        end
+
+                    end
+                    else begin
+                        baud_counter <= baud_counter + 1;
+                    end
+
+                end
+
+                DATA: begin
+                    if (baud_counter == CLKS_PER_BIT - 1) begin
+                        rx_shift_reg[bit_counter] <= rx_sync2;
+                        baud_counter <= 0;
+                        if (bit_counter == 3'b111) begin
+                            state <= STOP;
+                        end
+                        else begin
+                            bit_counter <= bit_counter+1;
+                        end
+                    end
+                    else begin
+                        baud_counter <= baud_counter + 1;
+                    end
+
+                end
+                
+                
+                
+                STOP: begin
+                    if (baud_counter == CLKS_PER_BIT - 1) begin
+                        if (rx_sync2 == 1) begin
+                            rx_data <= rx_shift_reg;
+                            rx_valid <= 1;
+                            state <= IDLE;
+
+                        end
+                        else begin
+                            state <= IDLE;
+
+                        end
+
+                    end
+                    else begin
+
+                        baud_counter <= baud_counter + 1;
+                    end
+
+                end
+
+
+                DONE: begin
+                    state <= IDLE;
+
+                end
+
+
+                default: begin
+                    state <= IDLE;
+                end
+
+            endcase
+
+        end
+    end
+
+endmodule
+
+
+uart_tx.v : 
+`timescale 1ns / 1ps
+
+module uart_tx #(
+    parameter CLK_FREQ  = 100000000,
+    parameter BAUD_RATE = 115200
+)(
+    input  wire       clk,
+    input  wire       rst,
+    input  wire       tx_start,
+    input  wire [7:0] tx_data,
+    output reg        tx,
+    output reg        tx_busy
+);
+    localparam CLKS_PER_BIT = CLK_FREQ / BAUD_RATE;
+    localparam IDLE  = 2'b00,
+               START = 2'b01,
+               DATA  = 2'b10,
+               STOP  = 2'b11;
+
+    reg [1:0]  state;
+    reg [15:0] clk_count;
+    reg [2:0]  bit_idx;
+    reg [7:0]  tx_buf;
+
+    always @(posedge clk) begin
+        if (rst) begin
+            state     <= IDLE;
+            tx        <= 1'b1;
+            tx_busy   <= 1'b0;
+            clk_count <= 0;
+            bit_idx   <= 0;
+            tx_buf    <= 8'h00;
+        end else begin
+            case (state)
+                IDLE: begin
+                    tx      <= 1'b1; 
+                    tx_busy <= 1'b0;
+                    if (tx_start) begin
+                        tx_buf    <= tx_data;
+                        tx_busy   <= 1'b1;
+                        clk_count <= 0;
+                        state     <= START;
+                    end
+                end
+
+                START: begin
+                    tx <= 1'b0; // Send Start bit
+                    if (clk_count < CLKS_PER_BIT - 1) begin
+                        clk_count <= clk_count + 1'b1;
+                    end else begin
+                        clk_count <= 0;
+                        bit_idx   <= 0;
+                        state     <= DATA;
+                    end
+                end
+
+                DATA: begin
+                    tx <= tx_buf[bit_idx];
+                    if (clk_count < CLKS_PER_BIT - 1) begin
+                        clk_count <= clk_count + 1'b1;
+                    end else begin
+                        clk_count <= 0;
+                        if (bit_idx < 7) begin
+                            bit_idx <= bit_idx + 1'b1;
+                        end else begin
+                            bit_idx <= 0;
+                            state   <= STOP;
+                        end
+                    end
+                end
+
+                STOP: begin
+                    tx <= 1'b1; // Send Stop bit
+                    if (clk_count < CLKS_PER_BIT - 1) begin
+                        clk_count <= clk_count + 1'b1;
+                    end else begin
+                        clk_count <= 0;
+                        tx_busy   <= 1'b0;
+                        state     <= IDLE;
+                    end
+                end
+
+                default: state <= IDLE;
+            endcase
+        end
+    end
+endmodule
+
+
+image.v : 
+`timescale 1ns / 1ps
+module gaussian_5x5 (
+    input clk,
+    input [7:0] p11, p12, p13, p14, p15, 
+    input [7:0] p21, p22, p23, p24, p25, 
+    input [7:0] p31, p32, p33, p34, p35, 
+    input [7:0] p41, p42, p43, p44, p45, 
+    input [7:0] p51, p52, p53, p54, p55, 
+    output reg [7:0] pixel_out
+);
+    reg [13:0] row1_sum, row2_sum, row3_sum, row4_sum, row5_sum;
+    reg [16:0] total_sum;
+    reg [31:0] scaled_sum;
+
+    always @(posedge clk) begin
+        row1_sum <= (p11*1) + (p12*4)  + (p13*7)  + (p14*4)  + (p15*1);
+        row2_sum <= (p21*4) + (p22*16) + (p23*26) + (p24*16) + (p25*4);
+        row3_sum <= (p31*7) + (p32*26) + (p33*41) + (p34*26) + (p35*7);
+        row4_sum <= (p41*4) + (p42*16) + (p43*26) + (p44*16) + (p45*4);
+        row5_sum <= (p51*1) + (p52*4)  + (p53*7)  + (p54*4)  + (p55*1);
+        
+        total_sum  <= row1_sum + row2_sum + row3_sum + row4_sum + row5_sum;
+        scaled_sum <= total_sum * 32'd15;
+        pixel_out  <= scaled_sum >> 12;
+    end
+endmodule 
+
+log_transform.v : 
+`timescale 1ns / 1ps
+module log_transform_lut (
+    input clk,
+    input [7:0] pixel_in,
+    output reg [11:0] log_pixel_out
+);
+    reg [11:0] log_rom [0:255]; 
+    initial $readmemh("log_values.mem", log_rom); 
+    always @(posedge clk) log_pixel_out <= log_rom[pixel_in]; 
+endmodule 
+
+min_max_tracker.v :
+module min_max_tracker (
+    input clk,
+    input frame_start,      // Signal indicating a new image has started
+    input valid_pixel,      // High when a pixel is on the belt
+    input [11:0] pixel_in,
+    output reg [11:0] frame_min,
+    output reg [11:0] frame_max
+);
+    
+    reg [11:0] current_min;
+    reg [11:0] current_max;
+
+    always @(posedge clk) begin
+        if (frame_start) begin
+            // When a new frame starts, save the old min/max for the Normalizer to use
+            frame_min <= current_min;
+            frame_max <= current_max;
+            
+            // Reset trackers for the new frame
+            current_min <= 12'hFFF; // Max possible 12-bit value
+            current_max <= 12'h000; // min possible 12-bit value
+        end else if (valid_pixel) begin
+            if (pixel_in < current_min) current_min <= pixel_in;
+            if (pixel_in > current_max) current_max <= pixel_in;
+        end
+    end
+endmodule
+
+
+normalization_pipeline.v : 
+`timescale 1ns / 1ps
+module min_max_normalizer (
+    input clk,
+    input [11:0] log_pixel_in,
+    input [11:0] frame_min,
+    input [11:0] frame_max,
+    output reg [7:0] enhanced_pixel_out
+);
+    (* ram_style = "block" *) reg [15:0] reciprocal_rom [0:4095];
+    initial $readmemh("reciprocal.mem", reciprocal_rom);
+
+    reg [11:0] delta, numerator_s1, numerator_s2;
+    reg [15:0] scale_factor;
+    reg [27:0] scaled_result;
+
+    always @(posedge clk) begin
+        delta        <= (frame_max > frame_min) ? (frame_max - frame_min) : 12'd1;
+        numerator_s1 <= (log_pixel_in > frame_min) ? (log_pixel_in - frame_min) : 12'd0;
+        
+        scale_factor <= reciprocal_rom[delta];
+        numerator_s2 <= numerator_s1; 
+        
+        scaled_result <= numerator_s2 * scale_factor;
+        
+        if ((scaled_result >> 16) > 28'd255)
+            enhanced_pixel_out <= 8'd255;
+        else
+            enhanced_pixel_out <= scaled_result[23:16]; 
+    end
+endmodule

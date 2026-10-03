@@ -1,7 +1,6 @@
 `timescale 1ns / 1ps
 module min_max_normalizer (
     input clk,
-    input en,
     input [11:0] log_pixel_in,
     input [11:0] frame_min,
     input [11:0] frame_max,
@@ -15,20 +14,17 @@ module min_max_normalizer (
     reg [27:0] scaled_result;
 
     always @(posedge clk) begin
-        if (en) begin
-            // Stage 1
-            delta        <= (frame_max > frame_min) ? (frame_max - frame_min) : 12'd1;
-            numerator_s1 <= (log_pixel_in > frame_min) ? (log_pixel_in - frame_min) : 12'd0;
-            // Stage 2
-            scale_factor <= reciprocal_rom[delta];
-            numerator_s2 <= numerator_s1; 
-            // Stage 3
-            scaled_result <= numerator_s2 * scale_factor;
-            // Stage 4
-            if ((scaled_result >> 16) > 28'd255)
-                enhanced_pixel_out <= 8'd255;
-            else
-                enhanced_pixel_out <= scaled_result[23:16]; 
-        end
+        delta        <= (frame_max > frame_min) ? (frame_max - frame_min) : 12'd1;
+        numerator_s1 <= (log_pixel_in > frame_min) ? (log_pixel_in - frame_min) : 12'd0;
+        
+        scale_factor <= reciprocal_rom[delta];
+        numerator_s2 <= numerator_s1; 
+        
+        scaled_result <= numerator_s2 * scale_factor;
+        
+        if ((scaled_result >> 16) > 28'd255)
+            enhanced_pixel_out <= 8'd255;
+        else
+            enhanced_pixel_out <= scaled_result[23:16]; 
     end
 endmodule
